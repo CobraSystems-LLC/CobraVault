@@ -21,6 +21,12 @@ python3 cobravault.py
 
 The encrypted vault file is stored next to the script as `vault.enc`.
 
+To generate a standalone password without opening the vault UI:
+
+```bash
+python3 cobravault.py --generate-password --length 24
+```
+
 ## Useful options
 
 - `--vault /path/to/vault.enc` to use a different encrypted vault file

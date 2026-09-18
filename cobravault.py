@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import base64
 import getpass
+import hashlib
 import json
 import os
 import secrets
@@ -238,10 +239,11 @@ def generate_password(
     if length < len(pools):
         raise VaultError(f"Length must be at least {len(pools)} to include all selected groups.")
 
-    rng = secrets.SystemRandom()
-    password_chars = [rng.choice(pool) for pool in pools]
-    password_chars.extend(rng.choice(all_chars) for _ in range(length - len(password_chars)))
-    rng.shuffle(password_chars)
+    password_chars = [secrets.choice(pool) for pool in pools]
+    password_chars.extend(secrets.choice(all_chars) for _ in range(length - len(password_chars)))
+    for index in range(len(password_chars) - 1, 0, -1):
+        swap_index = secrets.randbelow(index + 1)
+        password_chars[index], password_chars[swap_index] = password_chars[swap_index], password_chars[index]
     return "".join(password_chars)
 
 
@@ -402,11 +404,17 @@ class ClipboardManager:
 
     def copy_with_timeout(self, text: str, timeout_seconds: int = DEFAULT_CLIPBOARD_TIMEOUT) -> None:
         self._try_set(text)
+        expected_key = os.urandom(16)
+        expected_digest = hashlib.blake2b(text.encode("utf-8"), key=expected_key).hexdigest()
         popen_kwargs: dict[str, Any] = {
             "args": [
                 sys.executable,
                 str(self.script_path),
                 "--clear-clipboard",
+                "--clear-clipboard-key",
+                expected_key.hex(),
+                "--clear-clipboard-digest",
+                expected_digest,
                 "--clear-clipboard-timeout",
                 str(timeout_seconds),
             ],
@@ -419,8 +427,63 @@ class ClipboardManager:
             popen_kwargs["start_new_session"] = True
         subprocess.Popen(**popen_kwargs)
 
-    def clear_after_timeout(self, timeout_seconds: int) -> None:
+    def _try_get(self) -> str:
+        methods = []
+        if sys.platform.startswith("win"):
+            methods.append(
+                lambda: subprocess.run(
+                    [
+                        "powershell",
+                        "-NoProfile",
+                        "-Command",
+                        "Get-Clipboard -Raw",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                ).stdout
+            )
+        else:
+            methods.extend(
+                [
+                    lambda: subprocess.run(
+                        ["wl-paste", "--no-newline"],
+                        capture_output=True,
+                        text=True,
+                        check=True,
+                    ).stdout,
+                    lambda: subprocess.run(
+                        ["xclip", "-selection", "clipboard", "-o"],
+                        capture_output=True,
+                        text=True,
+                        check=True,
+                    ).stdout,
+                    lambda: subprocess.run(
+                        ["xsel", "--clipboard", "--output"],
+                        capture_output=True,
+                        text=True,
+                        check=True,
+                    ).stdout,
+                ]
+            )
+        methods.append(lambda: self._tk_command("get").stdout)
+        for method in methods:
+            try:
+                return method()
+            except Exception:
+                continue
+        return ""
+
+    def clear_after_timeout(self, timeout_seconds: int, expected_key_hex: str = "", expected_digest: str = "") -> None:
         time.sleep(timeout_seconds)
+        if expected_key_hex and expected_digest:
+            current = self._try_get()
+            current_digest = hashlib.blake2b(
+                current.encode("utf-8"),
+                key=bytes.fromhex(expected_key_hex),
+            ).hexdigest()
+            if current_digest != expected_digest:
+                return
         self._try_clear()
 
 
@@ -500,7 +563,10 @@ class VaultStore:
             raise VaultError("Vault file could not be written.") from exc
         finally:
             if temp_path and temp_path.exists():
-                temp_path.unlink(missing_ok=True)
+                try:
+                    temp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
     def save(self) -> None:
         self.data.setdefault("meta", {})
@@ -1048,6 +1114,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_CLIPBOARD_TIMEOUT,
         help=argparse.SUPPRESS,
     )
+    parser.add_argument("--clear-clipboard-key", default="", help=argparse.SUPPRESS)
+    parser.add_argument("--clear-clipboard-digest", default="", help=argparse.SUPPRESS)
     return parser
 
 
@@ -1058,7 +1126,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.clear_clipboard:
         try:
             ClipboardManager(script_path=Path(__file__).resolve()).clear_after_timeout(
-                timeout_seconds=args.clear_clipboard_timeout
+                timeout_seconds=args.clear_clipboard_timeout,
+                expected_key_hex=args.clear_clipboard_key,
+                expected_digest=args.clear_clipboard_digest,
             )
         except ClipboardError:
             return 0
