@@ -555,10 +555,10 @@ class VaultStore:
         return results
 
     def export_backup(self, target_path: Path) -> None:
-        if target_path.resolve() == self.vault_path.resolve():
+        if target_path.resolve(strict=False) == self.vault_path.resolve(strict=False):
             raise VaultError("Backup path must be different from the main vault file.")
         if (
-            target_path.parent.resolve() == self.vault_path.parent.resolve()
+            target_path.parent.resolve(strict=False) == self.vault_path.parent.resolve(strict=False)
             and target_path.name.startswith(f".{self.vault_path.name}.")
             and target_path.name.endswith(".tmp")
         ):
@@ -570,7 +570,12 @@ class VaultStore:
         except OSError as exc:
             raise VaultError("Backup file could not be written.") from exc
 
-    def import_backup(self, source_path: Path, backup_unlock_secret: str) -> None:
+    def import_backup(
+        self,
+        source_path: Path,
+        backup_unlock_secret: str,
+        current_master_secret: str,
+    ) -> None:
         try:
             payload = json.loads(source_path.read_text(encoding="utf-8"))
         except FileNotFoundError as exc:
@@ -582,7 +587,23 @@ class VaultStore:
             raise VaultError("Backup content is invalid.")
         imported_data.setdefault("meta", {})
         imported_data["meta"]["updated_at"] = now_iso()
-        self._write_payload(imported_data)
+        previous_key = bytearray(self.key_material)
+        previous_salt = self.salt
+        previous_iterations = self.iterations
+        fresh_salt = os.urandom(SALT_BYTES)
+        fresh_key = bytearray(derive_key(current_master_secret, fresh_salt, iterations=PBKDF2_ITERATIONS))
+        self.key_material = fresh_key
+        self.salt = fresh_salt
+        self.iterations = PBKDF2_ITERATIONS
+        try:
+            self._write_payload(imported_data)
+        except Exception:
+            best_effort_wipe(fresh_key)
+            self.key_material = previous_key
+            self.salt = previous_salt
+            self.iterations = previous_iterations
+            raise
+        best_effort_wipe(previous_key)
         self.data = imported_data
 
     def change_master_password(self, new_master_password: str) -> None:
@@ -934,7 +955,7 @@ class CobraVaultCLI:
     def export_backup(self) -> None:
         print_header("Export encrypted backup")
         destination = self.ask(f"Backup path [{self.vault_path.with_suffix(self.vault_path.suffix + BACKUP_SUFFIX)}]: ")
-        target = Path(destination) if destination else self.vault_path.with_suffix(self.vault_path.suffix + BACKUP_SUFFIX)
+        target = Path(destination).expanduser() if destination else self.vault_path.with_suffix(self.vault_path.suffix + BACKUP_SUFFIX)
         self.active_store.export_backup(target)
         print(f"Encrypted backup written to {target}")
 
@@ -949,8 +970,21 @@ class CobraVaultCLI:
             return
         if not self.ask_confirm("Importing replaces the current vault contents. Continue?", default=False):
             return
+        current_master_secret = self.ask_secret("Current master password for re-encryption: ")
+        candidate_key = bytearray(
+            derive_key(
+                current_master_secret,
+                self.active_store.salt,
+                iterations=self.active_store.iterations,
+            )
+        )
+        matches = secrets.compare_digest(bytes(candidate_key), bytes(self.active_store.key_material))
+        best_effort_wipe(candidate_key)
+        if not matches:
+            print("Current master password did not match.")
+            return
         backup_secret = self.ask_secret("Backup password for unlock only: ")
-        self.active_store.import_backup(source_path, backup_secret)
+        self.active_store.import_backup(source_path, backup_secret, current_master_secret)
         print("Backup imported and re-encrypted with the current master password.")
 
     def close(self) -> None:
