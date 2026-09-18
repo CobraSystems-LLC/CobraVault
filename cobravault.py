@@ -81,34 +81,6 @@ def prompt_non_empty(message: str) -> str:
         print("Value cannot be empty.")
 
 
-def prompt_int(message: str, default: int, minimum: int, maximum: int) -> int:
-    while True:
-        raw = prompt(f"{message} [{default}]: ")
-        if not raw:
-            return default
-        try:
-            value = int(raw)
-        except ValueError:
-            print("Please enter a valid number.")
-            continue
-        if minimum <= value <= maximum:
-            return value
-        print(f"Please choose a value between {minimum} and {maximum}.")
-
-
-def confirm(message: str, default: bool = False) -> bool:
-    suffix = "Y/n" if default else "y/N"
-    while True:
-        raw = prompt(f"{message} [{suffix}]: ").lower()
-        if not raw:
-            return default
-        if raw in {"y", "yes"}:
-            return True
-        if raw in {"n", "no"}:
-            return False
-        print("Please answer yes or no.")
-
-
 def clear_screen() -> None:
     os.system("cls" if os.name == "nt" else "clear")
 
@@ -226,26 +198,6 @@ def decrypt_payload(payload: dict[str, Any], master_secret: str) -> dict[str, An
         best_effort_wipe(key)
         if "plaintext" in locals():
             best_effort_wipe(plaintext)
-
-
-def password_strength(password: str) -> tuple[str, int]:
-    score = 0
-    checks = [
-        len(password) >= 12,
-        any(ch.islower() for ch in password),
-        any(ch.isupper() for ch in password),
-        any(ch.isdigit() for ch in password),
-        any(ch in string.punctuation for ch in password),
-        len(password) >= 16,
-    ]
-    score = sum(checks)
-    if score <= 2:
-        return ("Weak", score)
-    if score <= 4:
-        return ("Fair", score)
-    if score == 5:
-        return ("Good", score)
-    return ("Strong", score)
 
 
 def generate_password(
@@ -657,10 +609,34 @@ class CobraVaultCLI:
         return value
 
     def ask_confirm(self, message: str, default: bool = False) -> bool:
-        self.guard_auto_lock()
-        value = confirm(message, default=default)
-        self.touch()
-        return value
+        suffix = "Y/n" if default else "y/N"
+        while True:
+            self.guard_auto_lock()
+            raw = input(f"{message} [{suffix}]: ").strip().lower()
+            self.touch()
+            if not raw:
+                return default
+            if raw in {"y", "yes"}:
+                return True
+            if raw in {"n", "no"}:
+                return False
+            print("Please answer yes or no.")
+
+    def ask_int(self, message: str, default: int, minimum: int, maximum: int) -> int:
+        while True:
+            self.guard_auto_lock()
+            raw = input(f"{message} [{default}]: ").strip()
+            self.touch()
+            if not raw:
+                return default
+            try:
+                value = int(raw)
+            except ValueError:
+                print("Please enter a valid number.")
+                continue
+            if minimum <= value <= maximum:
+                return value
+            print(f"Please choose a value between {minimum} and {maximum}.")
 
     def ask_secret(self, message: str) -> str:
         self.guard_auto_lock()
@@ -668,17 +644,15 @@ class CobraVaultCLI:
         self.touch()
         return value
 
-    def ask_password_value(self, allow_generate: bool = True, current: str | None = None) -> str:
+    def ask_secret_value(self, allow_generate: bool = True, current: str | None = None) -> str:
         while True:
             if allow_generate:
-                choice = self.ask("[M]anual password, [G]enerate password, or [K]eep current? ").lower() if current is not None else self.ask("[M]anual password or [G]enerate password? ").lower()
+                choice = self.ask("[M]anual secret, [G]enerate password, or [K]eep current? ").lower() if current is not None else self.ask("[M]anual secret or [G]enerate password? ").lower()
                 if current is not None and choice in {"", "k", "keep"}:
                     return current
                 if choice in {"g", "generate"}:
-                    generated = self.interactive_generate_password()
-                    print(f"Generated password: {generated}")
-                    label, _ = password_strength(generated)
-                    print(f"Strength: {label}")
+                    generated = self.interactive_generate_secret()
+                    print(f"Generated value: {generated}")
                     if self.ask_confirm("Use this password?", default=True):
                         return generated
                     continue
@@ -688,8 +662,6 @@ class CobraVaultCLI:
             entered = self.ask_secret("Password: ")
             if current is not None and not entered:
                 return current
-            label, _ = password_strength(entered)
-            print(f"Strength: {label}")
             confirm_value = self.ask_secret("Confirm password: ")
             if entered != confirm_value:
                 print("Passwords do not match.")
@@ -703,8 +675,6 @@ class CobraVaultCLI:
             print("\nNo vault found. Let's create one.")
             while True:
                 master = self.ask_secret("Create a master password: ")
-                label, _ = password_strength(master)
-                print(f"Master password strength: {label}")
                 if len(master) < MIN_MASTER_PASSWORD_LENGTH:
                     print(f"Use at least {MIN_MASTER_PASSWORD_LENGTH} characters.")
                     continue
@@ -747,10 +717,10 @@ class CobraVaultCLI:
             elif choice == "3":
                 self.search_entries()
             elif choice == "4":
-                generated = self.interactive_generate_password()
-                print(f"Generated password: {generated}")
+                generated = self.interactive_generate_secret()
+                print(f"Generated value: {generated}")
                 if self.ask_confirm("Copy to clipboard?", default=True):
-                    self.copy_password(generated)
+                    self.copy_secret(generated)
             elif choice == "5":
                 self.change_master_password()
             elif choice == "6":
@@ -836,7 +806,7 @@ class CobraVaultCLI:
         if not title or not username:
             print("Title and username are required.")
             return
-        secret_value = self.ask_password_value(allow_generate=True)
+        secret_value = self.ask_secret_value(allow_generate=True)
         url = self.ask("URL (optional): ")
         notes = self.ask("Notes (optional): ")
         entry = {
@@ -859,7 +829,7 @@ class CobraVaultCLI:
         change_password = self.ask_confirm("Update the password?", default=False)
         secret_value = entry["secret"]
         if change_password:
-            secret_value = self.ask_password_value(allow_generate=True, current=entry["secret"])
+            secret_value = self.ask_secret_value(allow_generate=True, current=entry["secret"])
         url = self.ask(f"URL [{entry.get('url') or ''}]: ") or entry.get("url", "")
         notes = self.ask(f"Notes [{entry.get('notes') or ''}]: ") or entry.get("notes", "")
         updated = {
@@ -893,15 +863,15 @@ class CobraVaultCLI:
             return
         self.entry_details_menu(chosen["id"])
 
-    def interactive_generate_password(self) -> str:
+    def interactive_generate_secret(self) -> str:
         print_header("Generate password")
-        length = prompt_int("Length", 20, 8, 128)
-        use_upper = confirm("Include uppercase letters?", True)
-        use_lower = confirm("Include lowercase letters?", True)
-        use_digits = confirm("Include numbers?", True)
-        use_symbols = confirm("Include symbols?", True)
-        exclude_ambiguous = confirm("Exclude ambiguous characters (0/O/1/l/I)?", False)
-        password_value = generate_password(
+        length = self.ask_int("Length", 20, 8, 128)
+        use_upper = self.ask_confirm("Include uppercase letters?", True)
+        use_lower = self.ask_confirm("Include lowercase letters?", True)
+        use_digits = self.ask_confirm("Include numbers?", True)
+        use_symbols = self.ask_confirm("Include symbols?", True)
+        exclude_ambiguous = self.ask_confirm("Exclude ambiguous characters (0/O/1/l/I)?", False)
+        return generate_password(
             length=length,
             use_upper=use_upper,
             use_lower=use_lower,
@@ -909,12 +879,9 @@ class CobraVaultCLI:
             use_symbols=use_symbols,
             exclude_ambiguous=exclude_ambiguous,
         )
-        label, _ = password_strength(password_value)
-        print(f"Strength: {label}")
-        return password_value
 
     def copy_secret(self, secret_value: str) -> None:
-        timeout = prompt_int("Clipboard clear timeout in seconds", self.clipboard_timeout, 5, 600)
+        timeout = self.ask_int("Clipboard clear timeout in seconds", self.clipboard_timeout, 5, 600)
         try:
             self.clipboard.copy_with_timeout(secret_value, timeout_seconds=timeout)
             print(f"Copied to clipboard. It will be cleared in {timeout} seconds.")
@@ -924,15 +891,20 @@ class CobraVaultCLI:
     def change_master_password(self) -> None:
         print_header("Change master password")
         current_secret = self.ask_secret("Re-enter current master password: ")
-        try:
-            VaultStore.unlock(self.vault_path, current_secret)
-        except AuthenticationError:
+        candidate_key = bytearray(
+            derive_key(
+                current_secret,
+                self.active_store.salt,
+                iterations=self.active_store.iterations,
+            )
+        )
+        matches = secrets.compare_digest(bytes(candidate_key), bytes(self.active_store.key_material))
+        best_effort_wipe(candidate_key)
+        if not matches:
             print("Current master password did not match.")
             return
         while True:
             new_master_secret = self.ask_secret("New master password: ")
-            label, _ = password_strength(new_master_secret)
-            print(f"New master password strength: {label}")
             if len(new_master_secret) < MIN_MASTER_PASSWORD_LENGTH:
                 print(f"Use at least {MIN_MASTER_PASSWORD_LENGTH} characters.")
                 continue
