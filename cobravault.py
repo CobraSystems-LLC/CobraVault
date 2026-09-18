@@ -570,14 +570,14 @@ class VaultStore:
         except OSError as exc:
             raise VaultError("Backup file could not be written.") from exc
 
-    def import_backup(self, source_path: Path, backup_password: str) -> None:
+    def import_backup(self, source_path: Path, backup_unlock_secret: str) -> None:
         try:
             payload = json.loads(source_path.read_text(encoding="utf-8"))
         except FileNotFoundError as exc:
             raise VaultError("Backup file was not found.") from exc
         except (OSError, json.JSONDecodeError) as exc:
             raise VaultError("Backup file could not be read.") from exc
-        imported_data = decrypt_payload(payload, backup_password)
+        imported_data = decrypt_payload(payload, backup_unlock_secret)
         if not isinstance(imported_data, dict) or "entries" not in imported_data:
             raise VaultError("Backup content is invalid.")
         imported_data.setdefault("meta", {})
@@ -949,7 +949,7 @@ class CobraVaultCLI:
             return
         if not self.ask_confirm("Importing replaces the current vault contents. Continue?", default=False):
             return
-        backup_secret = self.ask_secret("Backup master password: ")
+        backup_secret = self.ask_secret("Backup password for unlock only: ")
         self.active_store.import_backup(source_path, backup_secret)
         print("Backup imported and re-encrypted with the current master password.")
 
@@ -1031,12 +1031,19 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.generate_password:
-        print(
-            generate_password(
-                length=args.length,
-                use_symbols=not args.no_symbols,
+        if not 8 <= args.length <= 128:
+            print("Error: --length must be between 8 and 128.")
+            return 1
+        try:
+            print(
+                generate_password(
+                    length=args.length,
+                    use_symbols=not args.no_symbols,
+                )
             )
-        )
+        except VaultError as exc:
+            print(f"Error: {exc}")
+            return 1
         return 0
 
     ensure_dependencies()
