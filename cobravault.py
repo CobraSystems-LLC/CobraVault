@@ -354,9 +354,7 @@ class ClipboardManager:
         )
 
     def _try_clear(self) -> None:
-        methods = [
-            lambda: self._tk_command("clear"),
-        ]
+        methods = []
         if sys.platform.startswith("win"):
             methods.append(
                 lambda: subprocess.run(
@@ -393,6 +391,7 @@ class ClipboardManager:
                     ),
                 ]
             )
+        methods.append(lambda: self._tk_command("clear"))
         for method in methods:
             try:
                 method()
@@ -408,7 +407,7 @@ class ClipboardManager:
                 sys.executable,
                 str(self.script_path),
                 "--clear-clipboard",
-                "--timeout",
+                "--clear-clipboard-timeout",
                 str(timeout_seconds),
             ],
             "stdout": subprocess.DEVNULL,
@@ -558,6 +557,12 @@ class VaultStore:
     def export_backup(self, target_path: Path) -> None:
         if target_path.resolve() == self.vault_path.resolve():
             raise VaultError("Backup path must be different from the main vault file.")
+        if (
+            target_path.parent.resolve() == self.vault_path.parent.resolve()
+            and target_path.name.startswith(f".{self.vault_path.name}.")
+            and target_path.name.endswith(".tmp")
+        ):
+            raise VaultError("Backup path cannot use the vault writer's temporary-file naming pattern.")
         target_path.parent.mkdir(parents=True, exist_ok=True)
         try:
             shutil.copy2(self.vault_path, target_path)
@@ -1003,7 +1008,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=argparse.SUPPRESS,
     )
-    parser.add_argument("--timeout", type=int, default=DEFAULT_CLIPBOARD_TIMEOUT, help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--clear-clipboard-timeout",
+        type=int,
+        default=DEFAULT_CLIPBOARD_TIMEOUT,
+        help=argparse.SUPPRESS,
+    )
     return parser
 
 
@@ -1013,7 +1023,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.clear_clipboard:
         try:
-            ClipboardManager(script_path=Path(__file__).resolve()).clear_after_timeout(timeout_seconds=args.timeout)
+            ClipboardManager(script_path=Path(__file__).resolve()).clear_after_timeout(
+                timeout_seconds=args.clear_clipboard_timeout
+            )
         except ClipboardError:
             return 0
         return 0
