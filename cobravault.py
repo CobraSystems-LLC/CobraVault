@@ -104,6 +104,13 @@ def best_effort_wipe(buffer: bytearray | None) -> None:
         buffer[index] = 0
 
 
+def restrict_file_permissions(path: Path) -> None:
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
 def ensure_dependencies() -> None:
     if AESGCM and PBKDF2HMAC and hashes:
         return
@@ -483,11 +490,13 @@ class VaultStore:
                 suffix=".tmp",
                 delete=False,
             ) as handle:
+                restrict_file_permissions(Path(handle.name))
                 handle.write(serialized)
                 handle.flush()
                 os.fsync(handle.fileno())
                 temp_path = Path(handle.name)
             os.replace(temp_path, self.vault_path)
+            restrict_file_permissions(self.vault_path)
         except OSError as exc:
             raise VaultError("Vault file could not be written.") from exc
         finally:
@@ -552,6 +561,7 @@ class VaultStore:
         target_path.parent.mkdir(parents=True, exist_ok=True)
         try:
             shutil.copy2(self.vault_path, target_path)
+            restrict_file_permissions(target_path)
         except OSError as exc:
             raise VaultError("Backup file could not be written.") from exc
 
@@ -1002,7 +1012,10 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.clear_clipboard:
-        ClipboardManager(script_path=Path(__file__).resolve()).clear_after_timeout(timeout_seconds=args.timeout)
+        try:
+            ClipboardManager(script_path=Path(__file__).resolve()).clear_after_timeout(timeout_seconds=args.timeout)
+        except ClipboardError:
+            return 0
         return 0
 
     if args.generate_password:
