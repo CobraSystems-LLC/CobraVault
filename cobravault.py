@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import base64
 import getpass
-import hashlib
 import json
 import os
 import secrets
@@ -14,6 +13,7 @@ import shutil
 import string
 import subprocess
 import sys
+import tempfile
 import textwrap
 import time
 import uuid
@@ -151,10 +151,10 @@ def b64decode(data: str) -> bytes:
     return base64.b64decode(data.encode("ascii"))
 
 
-def derive_key(master_password: str, salt: bytes, iterations: int = PBKDF2_ITERATIONS) -> bytes:
+def derive_key(master_secret: str, salt: bytes, iterations: int = PBKDF2_ITERATIONS) -> bytes:
     # The master password is never written to disk. We derive a fresh 256-bit
     # AES key from the password and a random per-vault salt each time we need it.
-    password_bytes = bytearray(master_password.encode("utf-8"))
+    secret_bytes = bytearray(master_secret.encode("utf-8"))
     try:
         kdf = PBKDF2HMAC(
             algorithm=hashes.SHA256(),
@@ -162,29 +162,31 @@ def derive_key(master_password: str, salt: bytes, iterations: int = PBKDF2_ITERA
             salt=salt,
             iterations=iterations,
         )
-        return kdf.derive(bytes(password_bytes))
+        return kdf.derive(bytes(secret_bytes))
     finally:
-        best_effort_wipe(password_bytes)
+        best_effort_wipe(secret_bytes)
 
 
-def encrypt_payload(data: dict[str, Any], master_password: str) -> dict[str, Any]:
-    salt = os.urandom(SALT_BYTES)
+def encrypt_payload(
+    data: dict[str, Any],
+    key_material: bytearray,
+    salt: bytes,
+    iterations: int = PBKDF2_ITERATIONS,
+) -> dict[str, Any]:
     nonce = os.urandom(NONCE_BYTES)
-    key = bytearray(derive_key(master_password, salt))
     plaintext = bytearray(json.dumps(data, indent=2, sort_keys=True).encode("utf-8"))
     try:
         # AES-GCM provides both encryption and integrity protection for the
         # entire JSON payload, so tampering is detected during unlock.
-        ciphertext = AESGCM(bytes(key)).encrypt(nonce, bytes(plaintext), None)
+        ciphertext = AESGCM(bytes(key_material)).encrypt(nonce, bytes(plaintext), None)
     finally:
-        best_effort_wipe(key)
         best_effort_wipe(plaintext)
     return {
         "format": APP_NAME,
         "version": FORMAT_VERSION,
         "kdf": {
             "name": "PBKDF2-HMAC-SHA256",
-            "iterations": PBKDF2_ITERATIONS,
+            "iterations": iterations,
             "salt": b64encode(salt),
         },
         "cipher": {
@@ -195,18 +197,26 @@ def encrypt_payload(data: dict[str, Any], master_password: str) -> dict[str, Any
     }
 
 
-def decrypt_payload(payload: dict[str, Any], master_password: str) -> dict[str, Any]:
+def payload_kdf_metadata(payload: dict[str, Any]) -> tuple[int, bytes]:
     try:
         if payload["format"] != APP_NAME or payload["version"] != FORMAT_VERSION:
             raise VaultError("Unsupported vault format.")
         iterations = int(payload["kdf"]["iterations"])
         salt = b64decode(payload["kdf"]["salt"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise VaultError("Vault file is corrupted or incomplete.") from exc
+    return iterations, salt
+
+
+def decrypt_payload(payload: dict[str, Any], master_secret: str) -> dict[str, Any]:
+    iterations, salt = payload_kdf_metadata(payload)
+    try:
         nonce = b64decode(payload["cipher"]["nonce"])
         ciphertext = b64decode(payload["cipher"]["ciphertext"])
     except (KeyError, TypeError, ValueError) as exc:
         raise VaultError("Vault file is corrupted or incomplete.") from exc
 
-    key = bytearray(derive_key(master_password, salt, iterations=iterations))
+    key = bytearray(derive_key(master_secret, salt, iterations=iterations))
     try:
         plaintext = bytearray(AESGCM(bytes(key)).decrypt(nonce, ciphertext, None))
         return json.loads(plaintext.decode("utf-8"))
@@ -384,52 +394,6 @@ class ClipboardManager:
             + "\n".join(errors)
         )
 
-    def _try_get(self) -> str:
-        methods = [lambda: self._tk_command("get").stdout]
-        if sys.platform.startswith("win"):
-            methods.append(
-                lambda: subprocess.run(
-                    [
-                        "powershell",
-                        "-NoProfile",
-                        "-Command",
-                        "Get-Clipboard -Raw",
-                    ],
-                    capture_output=True,
-                    text=True,
-                    check=True,
-                ).stdout
-            )
-        else:
-            methods.extend(
-                [
-                    lambda: subprocess.run(
-                        ["wl-paste", "--no-newline"],
-                        capture_output=True,
-                        text=True,
-                        check=True,
-                    ).stdout,
-                    lambda: subprocess.run(
-                        ["xclip", "-selection", "clipboard", "-o"],
-                        capture_output=True,
-                        text=True,
-                        check=True,
-                    ).stdout,
-                    lambda: subprocess.run(
-                        ["xsel", "--clipboard", "--output"],
-                        capture_output=True,
-                        text=True,
-                        check=True,
-                    ).stdout,
-                ]
-            )
-        for method in methods:
-            try:
-                return method()
-            except Exception:
-                continue
-        return ""
-
     def _try_clear(self) -> None:
         methods = [
             lambda: self._tk_command("clear"),
@@ -480,14 +444,11 @@ class ClipboardManager:
 
     def copy_with_timeout(self, text: str, timeout_seconds: int = DEFAULT_CLIPBOARD_TIMEOUT) -> None:
         self._try_set(text)
-        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
         popen_kwargs: dict[str, Any] = {
             "args": [
                 sys.executable,
                 str(self.script_path),
                 "--clear-clipboard",
-                "--expected-hash",
-                digest,
                 "--timeout",
                 str(timeout_seconds),
             ],
@@ -500,21 +461,23 @@ class ClipboardManager:
             popen_kwargs["start_new_session"] = True
         subprocess.Popen(**popen_kwargs)
 
-    def clear_if_unchanged(self, expected_hash: str, timeout_seconds: int) -> None:
+    def clear_after_timeout(self, timeout_seconds: int) -> None:
         time.sleep(timeout_seconds)
-        current = self._try_get()
-        if hashlib.sha256(current.encode("utf-8")).hexdigest() == expected_hash:
-            self._try_clear()
+        self._try_clear()
 
 
 @dataclass
 class VaultStore:
     vault_path: Path
-    master_password: str
+    key_material: bytearray
+    salt: bytes
+    iterations: int
     data: dict[str, Any]
 
     @classmethod
-    def initialize_new(cls, vault_path: Path, master_password: str) -> "VaultStore":
+    def initialize_new(cls, vault_path: Path, master_secret: str) -> "VaultStore":
+        salt = os.urandom(SALT_BYTES)
+        key_material = bytearray(derive_key(master_secret, salt))
         data = {
             "entries": [],
             "meta": {
@@ -522,33 +485,67 @@ class VaultStore:
                 "updated_at": now_iso(),
             },
         }
-        store = cls(vault_path=vault_path, master_password=master_password, data=data)
+        store = cls(
+            vault_path=vault_path,
+            key_material=key_material,
+            salt=salt,
+            iterations=PBKDF2_ITERATIONS,
+            data=data,
+        )
         store.save()
         return store
 
     @classmethod
-    def unlock(cls, vault_path: Path, master_password: str) -> "VaultStore":
+    def unlock(cls, vault_path: Path, master_secret: str) -> "VaultStore":
         try:
             payload = json.loads(vault_path.read_text(encoding="utf-8"))
         except FileNotFoundError as exc:
             raise VaultError("Vault file was not found.") from exc
         except (OSError, json.JSONDecodeError) as exc:
             raise VaultError("Vault file could not be read.") from exc
-        data = decrypt_payload(payload, master_password)
+        data = decrypt_payload(payload, master_secret)
         if not isinstance(data, dict) or "entries" not in data:
             raise VaultError("Vault content is invalid.")
         data.setdefault("meta", {})
-        return cls(vault_path=vault_path, master_password=master_password, data=data)
+        iterations, salt = payload_kdf_metadata(payload)
+        key_material = bytearray(derive_key(master_secret, salt, iterations=iterations))
+        return cls(
+            vault_path=vault_path,
+            key_material=key_material,
+            salt=salt,
+            iterations=iterations,
+            data=data,
+        )
+
+    def _write_payload(self, data: dict[str, Any]) -> None:
+        payload = encrypt_payload(data, self.key_material, self.salt, self.iterations)
+        serialized = json.dumps(payload, indent=2)
+        self.vault_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                "w",
+                encoding="utf-8",
+                dir=self.vault_path.parent,
+                prefix=f".{self.vault_path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as handle:
+                handle.write(serialized)
+                handle.flush()
+                os.fsync(handle.fileno())
+                temp_path = Path(handle.name)
+            os.replace(temp_path, self.vault_path)
+        except OSError as exc:
+            raise VaultError("Vault file could not be written.") from exc
+        finally:
+            if temp_path and temp_path.exists():
+                temp_path.unlink(missing_ok=True)
 
     def save(self) -> None:
         self.data.setdefault("meta", {})
         self.data["meta"]["updated_at"] = now_iso()
-        payload = encrypt_payload(self.data, self.master_password)
-        self.vault_path.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            self.vault_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        except OSError as exc:
-            raise VaultError("Vault file could not be written.") from exc
+        self._write_payload(self.data)
 
     def list_entries(self) -> list[dict[str, Any]]:
         entries = self.data.get("entries", [])
@@ -616,12 +613,26 @@ class VaultStore:
         imported_data = decrypt_payload(payload, backup_password)
         if not isinstance(imported_data, dict) or "entries" not in imported_data:
             raise VaultError("Backup content is invalid.")
+        imported_data.setdefault("meta", {})
+        imported_data["meta"]["updated_at"] = now_iso()
+        self._write_payload(imported_data)
         self.data = imported_data
-        self.save()
 
     def change_master_password(self, new_master_password: str) -> None:
-        self.master_password = new_master_password
-        self.save()
+        previous_key = bytearray(self.key_material)
+        previous_salt = self.salt
+        new_salt = os.urandom(SALT_BYTES)
+        new_key = bytearray(derive_key(new_master_password, new_salt, iterations=self.iterations))
+        self.key_material = new_key
+        self.salt = new_salt
+        try:
+            self.save()
+        except Exception:
+            best_effort_wipe(new_key)
+            self.key_material = previous_key
+            self.salt = previous_salt
+            raise
+        best_effort_wipe(previous_key)
 
 
 class CobraVaultCLI:
@@ -791,7 +802,7 @@ class CobraVaultCLI:
                 return
             print_header(entry["title"])
             print(f"Username : {entry['username']}")
-            print(f"Password : {mask_secret(entry['password'])}")
+            print(f"Password : {mask_secret(entry['secret'])}")
             print(f"URL      : {entry.get('url') or '-'}")
             print(f"Notes    : {entry.get('notes') or '-'}")
             print(f"Updated  : {entry.get('updated_at', '-')}")
@@ -802,9 +813,9 @@ class CobraVaultCLI:
             print("5. Back")
             choice = self.ask("Choose an option: ")
             if choice == "1":
-                print(f"Password: {entry['password']}")
+                print(f"Password: {entry['secret']}")
             elif choice == "2":
-                self.copy_password(entry["password"])
+                self.copy_secret(entry["secret"])
             elif choice == "3":
                 self.edit_entry(entry)
                 return
@@ -825,14 +836,14 @@ class CobraVaultCLI:
         if not title or not username:
             print("Title and username are required.")
             return
-        password_value = self.ask_password_value(allow_generate=True)
+        secret_value = self.ask_password_value(allow_generate=True)
         url = self.ask("URL (optional): ")
         notes = self.ask("Notes (optional): ")
         entry = {
             "id": uuid.uuid4().hex,
             "title": title,
             "username": username,
-            "password": password_value,
+            "secret": secret_value,
             "url": url,
             "notes": notes,
             "created_at": now_iso(),
@@ -846,15 +857,15 @@ class CobraVaultCLI:
         title = self.ask(f"Service/title [{entry['title']}]: ") or entry["title"]
         username = self.ask(f"Username [{entry['username']}]: ") or entry["username"]
         change_password = self.ask_confirm("Update the password?", default=False)
-        password_value = entry["password"]
+        secret_value = entry["secret"]
         if change_password:
-            password_value = self.ask_password_value(allow_generate=True, current=entry["password"])
+            secret_value = self.ask_password_value(allow_generate=True, current=entry["secret"])
         url = self.ask(f"URL [{entry.get('url') or ''}]: ") or entry.get("url", "")
         notes = self.ask(f"Notes [{entry.get('notes') or ''}]: ") or entry.get("notes", "")
         updated = {
             "title": title,
             "username": username,
-            "password": password_value,
+            "secret": secret_value,
             "url": url,
             "notes": notes,
         }
@@ -902,32 +913,34 @@ class CobraVaultCLI:
         print(f"Strength: {label}")
         return password_value
 
-    def copy_password(self, password_value: str) -> None:
+    def copy_secret(self, secret_value: str) -> None:
         timeout = prompt_int("Clipboard clear timeout in seconds", self.clipboard_timeout, 5, 600)
         try:
-            self.clipboard.copy_with_timeout(password_value, timeout_seconds=timeout)
+            self.clipboard.copy_with_timeout(secret_value, timeout_seconds=timeout)
             print(f"Copied to clipboard. It will be cleared in {timeout} seconds.")
         except ClipboardError as exc:
             print(exc)
 
     def change_master_password(self) -> None:
         print_header("Change master password")
-        current = self.ask_secret("Re-enter current master password: ")
-        if current != self.active_store.master_password:
+        current_secret = self.ask_secret("Re-enter current master password: ")
+        try:
+            VaultStore.unlock(self.vault_path, current_secret)
+        except AuthenticationError:
             print("Current master password did not match.")
             return
         while True:
-            new_master = self.ask_secret("New master password: ")
-            label, _ = password_strength(new_master)
+            new_master_secret = self.ask_secret("New master password: ")
+            label, _ = password_strength(new_master_secret)
             print(f"New master password strength: {label}")
-            if len(new_master) < MIN_MASTER_PASSWORD_LENGTH:
+            if len(new_master_secret) < MIN_MASTER_PASSWORD_LENGTH:
                 print(f"Use at least {MIN_MASTER_PASSWORD_LENGTH} characters.")
                 continue
-            confirm_master = self.ask_secret("Confirm new master password: ")
-            if new_master != confirm_master:
+            confirm_master_secret = self.ask_secret("Confirm new master password: ")
+            if new_master_secret != confirm_master_secret:
                 print("Passwords do not match.")
                 continue
-            self.active_store.change_master_password(new_master)
+            self.active_store.change_master_password(new_master_secret)
             print("Master password changed.")
             return
 
@@ -949,13 +962,13 @@ class CobraVaultCLI:
             return
         if not self.ask_confirm("Importing replaces the current vault contents. Continue?", default=False):
             return
-        backup_password = self.ask_secret("Backup master password: ")
-        self.active_store.import_backup(source_path, backup_password)
+        backup_secret = self.ask_secret("Backup master password: ")
+        self.active_store.import_backup(source_path, backup_secret)
         print("Backup imported and re-encrypted with the current master password.")
 
     def close(self) -> None:
         if self.store:
-            self.store.master_password = ""
+            best_effort_wipe(self.store.key_material)
             self.store.data.clear()
             self.store = None
 
@@ -1008,7 +1021,6 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=argparse.SUPPRESS,
     )
-    parser.add_argument("--expected-hash", default="", help=argparse.SUPPRESS)
     parser.add_argument("--timeout", type=int, default=DEFAULT_CLIPBOARD_TIMEOUT, help=argparse.SUPPRESS)
     return parser
 
@@ -1016,13 +1028,9 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    ensure_dependencies()
 
     if args.clear_clipboard:
-        ClipboardManager(script_path=Path(__file__).resolve()).clear_if_unchanged(
-            expected_hash=args.expected_hash,
-            timeout_seconds=args.timeout,
-        )
+        ClipboardManager(script_path=Path(__file__).resolve()).clear_after_timeout(timeout_seconds=args.timeout)
         return 0
 
     if args.generate_password:
@@ -1034,6 +1042,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
 
+    ensure_dependencies()
     return run_cli(vault_path=args.vault.expanduser().resolve(), clipboard_timeout=args.clipboard_timeout)
 
 

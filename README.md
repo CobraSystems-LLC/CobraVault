@@ -16,7 +16,7 @@ python3 -m pip install cryptography
 ## Run
 
 ```bash
-python3 /home/runner/work/CobraVault/CobraVault/cobravault.py
+python3 cobravault.py
 ```
 
 The encrypted vault file is stored next to the script as `vault.enc`.
